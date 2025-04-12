@@ -766,6 +766,7 @@ def main():
                     Args:
                         folder_name: Name of the folder to create
                         parent_path: Optional path where the folder should be created (default: root)
+                        ENSURE THAT THE DEFAULT PATH IS ROOT!!!
                         
                     Returns:
                         ID of the created folder and its full path
@@ -888,13 +889,80 @@ def main():
                     llm=llm,
                     tools=tools,
                     agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,  # Changed agent type
-                    verbose=True
+                    verbose=True,
+                    handle_parsing_errors=True
                 )
 
-                # Run the agent
+                # Run the agent with proper tool execution tracking
                 with st.spinner("Thinking..."):
-                    response = agent.run(query)
-                    
+                    try:
+                        # Debug information to track execution
+                        st.write("Starting agent execution...")
+                        
+                        # Create a special callback handler to log tool execution
+                        from langchain.callbacks.base import BaseCallbackHandler
+                        
+                        class ToolExecutionHandler(BaseCallbackHandler):
+                            def on_tool_start(self, serialized, input_str, **kwargs):
+                                tool_name = serialized.get("name", "unknown")
+                                st.write(f"🔧 Executing tool: {tool_name} with input: {input_str}")
+                                
+                            def on_tool_end(self, output, **kwargs):
+                                st.write(f"✅ Tool execution result: {output[:100]}...")
+                                
+                            def on_tool_error(self, error, **kwargs):
+                                st.write(f"❌ Tool execution error: {str(error)}")
+                        
+                        # Explicitly configure the agent to run with our handler
+                        custom_handler = ToolExecutionHandler()
+                        
+                        # Run the agent with explicit callbacks
+                        response = agent.run(
+                            query,
+                            callbacks=[custom_handler]
+                        )
+                        
+                    except Exception as e:
+                        st.error(f"Agent execution error: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+                        
+                        # Try to recover what the agent was attempting
+                        if "Could not parse LLM output" in str(e):
+                            st.warning("The agent had trouble formatting its response. Let me try once more with simpler instructions.")
+                            
+                            # Simplified retry with more direct instructions
+                            retry_prompt = f"""I need to {query} in Google Drive. Please tell me exactly which 
+                            of these functions to use and with what parameters:
+                            - create_drive_folder(folder_name, parent_path)
+                            - list_drive_files(folder_path)
+                            - move_drive_file(file_path, destination_folder_path)
+                            - delete_drive_item(path)
+                            - view_file_content(file_path)
+                            
+                            Respond with just the function call and parameters."""
+                            
+                            try:
+                                simple_response = llm.invoke(retry_prompt)
+                                st.write("Simplified response:")
+                                st.write(simple_response)
+                                
+                                # Try to manually execute the function based on the response
+                                if "delete_drive_item" in simple_response:
+                                    import re
+                                    path_match = re.search(r'delete_drive_item\(["\']([^"\']+)["\']', simple_response)
+                                    if path_match:
+                                        path = path_match.group(1)
+                                        st.write(f"Executing: delete_drive_item({path})")
+                                        result = delete_drive_item(path)
+                                        st.write(f"Result: {result}")
+                                # Add similar handlers for other functions
+                                
+                            except Exception as retry_error:
+                                st.error(f"Retry failed: {str(retry_error)}")
+                        
+                        response = "I encountered an error while trying to perform this action."
+                
                 st.success("Agent Response:")
                 st.write(response)
 
