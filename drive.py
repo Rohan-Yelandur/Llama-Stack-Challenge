@@ -12,33 +12,22 @@ logging.basicConfig(level=logging.DEBUG)
 # Define the scopes
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
-def create_folder(folder_name):
-    """Create a folder in Google Drive and return its ID and tokens."""
-    # Start the OAuth flow
+def authenticate():
+    """Authenticate with Google Drive and return credentials"""
     flow = InstalledAppFlow.from_client_secrets_file(
         'credentials.json', SCOPES)
     
-    print("Starting OAuth flow on port 3000...")
     st.write("Starting OAuth flow...")
-    creds = flow.run_local_server(port=3000)  # Changed port to avoid conflict with Streamlit
-    print(f"OAuth completed. Access token: {creds.token[:10]}...")
-    
-    # Get tokens
-    token_info = {
-        "access_token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": creds.scopes
-    }
-    
-    print(f"Tokens received: {json.dumps(token_info, indent=2)}")
-    
-    # Build the Drive API service
-    print("Building Drive API service...")
-    service = build('drive', 'v3', credentials=creds)
-    
+    creds = flow.run_local_server(port=3000)
+    st.write("Authentication successful!")
+    return creds
+
+def get_drive_service(creds):
+    """Build and return the Drive API service"""
+    return build('drive', 'v3', credentials=creds)
+
+
+def create_folder(service, folder_name):
     # Create a folder
     folder_metadata = {
         'name': folder_name,
