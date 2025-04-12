@@ -6,6 +6,13 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 import json
 import logging
 import io
+import os
+import csv
+
+
+from langchain.agents import initialize_agent, AgentType
+from langchain_ollama import OllamaLLM
+from langchain.agents import load_tools
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
@@ -47,8 +54,23 @@ def authenticate():
         raise RuntimeError(f"Authentication failed: {str(e)}. Try clearing your browser cookies and cache.")
 
 def get_drive_service(creds):
-    """Build and return the Drive API service"""
-    return build('drive', 'v3', credentials=creds)
+    folder_metadata = {
+        'name': folder_name,
+        'mimeType': 'application/vnd.google-apps.folder'
+    }
+    
+    # If a parent folder is specified, add it to the metadata
+    if parent_id:
+        folder_metadata['parents'] = [parent_id]
+        
+    print(f"Making API request to create folder: {json.dumps(folder_metadata, indent=2)}")
+    folder = service.files().create(body=folder_metadata, fields='id').execute()
+    print(f"API response: {json.dumps(folder, indent=2)}")
+    
+    folder_id = folder.get('id')
+    print(f"Folder created with ID: {folder_id}")
+    
+    return folder_id
 
 def create_folder(service, folder_name, parent_id=None):
     """Create a folder in Google Drive.
@@ -79,17 +101,43 @@ def create_folder(service, folder_name, parent_id=None):
     
     return folder_id
 
-def get_file_content(service, file_id):
+def save_file_to_documents(content, filename):
     """
-    Download and return the content of a file from Google Drive.
+    Save file content to the documents folder in the same directory.
     
     Args:
-        service: Google Drive API service instance
-        file_id: ID of the file to download
+        content: File content as bytes
+        filename: Name to save the file as
         
     Returns:
-        File content as bytes
+        Path where the file was saved
     """
+    # Create documents directory if it doesn't exist
+    documents_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'documents')
+    if not os.path.exists(documents_dir):
+        os.makedirs(documents_dir)
+    
+    # Clean filename to avoid path traversal issues
+    safe_filename = os.path.basename(filename)
+    
+    # Create full path
+    file_path = os.path.join(documents_dir, safe_filename)
+    
+    # If file exists, append a number to avoid overwriting
+    base_name, extension = os.path.splitext(safe_filename)
+    counter = 1
+    while os.path.exists(file_path):
+        file_path = os.path.join(documents_dir, f"{base_name}_{counter}{extension}")
+        counter += 1
+    
+    # Save the file
+    mode = 'wb' if isinstance(content, bytes) else 'w'
+    with open(file_path, mode) as f:
+        f.write(content)
+    
+    return file_path
+
+def get_file_content(service, file_id):
     try:
         # Get file metadata to check if it's a Google Workspace file
         file_metadata = service.files().get(fileId=file_id, fields='mimeType,name').execute()
@@ -139,16 +187,6 @@ def get_file_content(service, file_id):
         raise
     
 def list_files(service, page_size=10, query=None):
-    """List files in Google Drive.
-    
-    Args:
-        service: Google Drive API service instance
-        page_size: Maximum number of files to return
-        query: Search query string (see https://developers.google.com/drive/api/v3/search-files)
-        
-    Returns:
-        List of file metadata
-    """
     results = []
     page_token = None
     
@@ -183,16 +221,6 @@ def list_files(service, page_size=10, query=None):
     return results
 
 def move_file(service, file_id, folder_id):
-    """Move a file to a folder in Google Drive.
-    
-    Args:
-        service: Google Drive API service instance
-        file_id: ID of the file to move
-        folder_id: ID of the destination folder
-        
-    Returns:
-        Updated file metadata
-    """
     # Get the file's current parents
     file = service.files().get(fileId=file_id, fields='parents').execute()
     previous_parents = ",".join(file.get('parents', []))
@@ -208,16 +236,6 @@ def move_file(service, file_id, folder_id):
     return updated_file
 
 def move_file(service, file_id, folder_id):
-    """Move a file to a folder in Google Drive.
-    
-    Args:
-        service: Google Drive API service instance
-        file_id: ID of the file to move
-        folder_id: ID of the destination folder
-        
-    Returns:
-        Updated file metadata
-    """
     # Get the file's current parents
     file = service.files().get(fileId=file_id, fields='parents').execute()
     previous_parents = ",".join(file.get('parents', []))
@@ -231,9 +249,6 @@ def move_file(service, file_id, folder_id):
     ).execute()
     
     return updated_file
-
-
-
 
 def find_id_by_path(service, path):
     # Remove leading and trailing slashes
@@ -319,17 +334,6 @@ def delete_by_path(service, path, is_folder=None):
         raise
 
 def list_files(service, folder_path='/', page_size=10, query=None):
-    """List files in a specific folder in Google Drive identified by path.
-    
-    Args:
-        service: Google Drive API service instance
-        folder_path: Path to the folder to list files from (e.g., '/My Folder')
-        page_size: Maximum number of files to return
-        query: Additional search query string
-        
-    Returns:
-        List of file metadata
-    """
     try:
         # Find the folder ID from the path
         folder_id = find_id_by_path(service, folder_path)
@@ -380,16 +384,6 @@ def list_files(service, folder_path='/', page_size=10, query=None):
         raise
         
 def get_file_content(service, file_path):
-    """
-    Download and return the content of a file from Google Drive using its path.
-    
-    Args:
-        service: Google Drive API service instance
-        file_path: Path to the file (e.g., '/My Folder/document.txt')
-        
-    Returns:
-        File content as bytes
-    """
     try:
         # Find the file ID from the path
         file_id = find_id_by_path(service, file_path)
@@ -441,11 +435,76 @@ def get_file_content(service, file_path):
         logging.error(f"Error downloading file at path '{file_path}': {str(e)}")
         raise
 
-
-
-
-
-
+def list_all_files_and_save(service):
+    """
+    Lists all files/folders in Google Drive and saves the list to a CSV file in the documents directory.
+    
+    Args:
+        service: Google Drive API service instance
+        
+    Returns:
+        Path to the saved CSV file and the list of files
+    """
+    try:
+        # Get all files (not just in a specific folder)
+        all_files = []
+        page_token = None
+        
+        while True:
+            # Query all files that aren't trashed
+            request = service.files().list(
+                q="trashed = false",
+                pageSize=1000,  # Get a large batch
+                fields="nextPageToken, files(id, name, mimeType, parents, createdTime, modifiedTime, size, webViewLink)",
+                pageToken=page_token
+            )
+            
+            response = request.execute()
+            all_files.extend(response.get('files', []))
+            
+            # Get the next page token
+            page_token = response.get('nextPageToken', None)
+            
+            # If there are no more pages, break the loop
+            if page_token is None:
+                break
+        
+        # Create documents directory if it doesn't exist
+        documents_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'documents')
+        if not os.path.exists(documents_dir):
+            os.makedirs(documents_dir)
+        
+        # Create a timestamped filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_filename = f"drive_files_{timestamp}.csv"
+        csv_path = os.path.join(documents_dir, csv_filename)
+        
+        # Write the files to a CSV
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Name', 'Type', 'ID', 'Created', 'Modified', 'Size (bytes)', 'Parents', 'Web Link'])
+            
+            for file in all_files:
+                # Determine file type
+                file_type = "Folder" if file.get("mimeType") == "application/vnd.google-apps.folder" else "File"
+                
+                # Write file info to CSV
+                writer.writerow([
+                    file.get('name', 'Unknown'),
+                    file_type,
+                    file.get('id', ''),
+                    file.get('createdTime', ''),
+                    file.get('modifiedTime', ''),
+                    file.get('size', 'N/A'),
+                    file.get('parents', []),
+                    file.get('webViewLink', '')
+                ])
+        
+        return csv_path, all_files
+        
+    except Exception as e:
+        logging.error(f"Error listing all files: {str(e)}")
+        raise
 
 
 def main():
@@ -460,7 +519,7 @@ def main():
                 creds, token_info = authenticate()
                 st.session_state.creds = creds
                 st.session_state.token_info = token_info
-                st.session_state.service = get_drive_service(creds)
+                st.session_state.service = build('drive', 'v3', credentials=creds)
                 st.success("Authentication successful!")
         except Exception as e:
             st.error(f"Authentication failed: {str(e)}")
@@ -469,7 +528,7 @@ def main():
                 st.experimental_rerun()
     
     if 'service' in st.session_state:
-        tab1, tab2, tab3, tab4 = st.tabs(["Create Folder", "Delete Item", "Move File", "View File"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Create Folder", "Delete Item", "Move File", "View File", "Drive Agent"])
         
         # Tab 1: Create folder (original functionality)
         with tab1:
@@ -539,9 +598,8 @@ def main():
     # Update Tab 3: Move files
     with tab3:
         st.header("Move Files")
-        
         folder_path_to_list = st.text_input("Enter folder path to list files from (leave empty for root)", value="/")
-        
+    
         if st.button("List Files"):
             try:
                 with st.spinner(f"Listing files from {folder_path_to_list}..."):
@@ -604,8 +662,14 @@ def main():
             try:
                 with st.spinner(f"Downloading content of {file_path}..."):
                     content = get_file_content(st.session_state.service, file_path)
-                    
+                    save_file_to_documents(content, "hello.txt")
                     # Try to detect content type
+                    # Get proper file name from path
+                    file_name = file_path.strip('/').split('/')[-1]
+                    
+                    # Save the file with its proper name
+                    saved_path = save_file_to_documents(content, file_name)
+                    st.success(f"File saved locally to: {saved_path}")
                     try:
                         # For text files
                         text_content = content.decode("utf-8")
@@ -658,7 +722,12 @@ def main():
                     try:
                         with st.spinner(f"Downloading content of {selected_path}..."):
                             content = get_file_content(st.session_state.service, selected_path)
+                            # Get proper file name from path
+                            file_name = file_path.strip('/').split('/')[-1]
                             
+                            # Save the file with its proper name
+                            saved_path = save_file_to_documents(content, file_name)
+                            st.success(f"File saved locally to: {saved_path}")
                             # Try to detect content type
                             try:
                                 # For text files
@@ -676,6 +745,163 @@ def main():
                                 st.download_button("Download File", content, file_name=selected_file_name)
                     except Exception as e:
                         st.error(f"Error downloading file: {str(e)}")
+    #AGENT MODEL
+    with tab5:
+        st.header("Drive Agent - Ask or Restructure")
+
+        query = st.text_input("What would you like to do? (e.g., 'Move all images to /Photos')")
+
+        if query:
+            try:
+                # Initialize the LLM
+                llm = OllamaLLM(model="llama3.2:3b")
+                
+                # Create custom tools wrapping our Google Drive functions
+                from langchain.tools import BaseTool, StructuredTool, tool
+                
+                @tool
+                def create_drive_folder(folder_name, parent_path=None):
+                    """Create a new folder in Google Drive.
+                    
+                    Args:
+                        folder_name: Name of the folder to create
+                        parent_path: Optional path where the folder should be created (default: root)
                         
+                    Returns:
+                        ID of the created folder and its full path
+                    """
+                    service = st.session_state.service
+                    parent_id = None
+                    
+                    if parent_path:
+                        try:
+                            parent_id = find_id_by_path(service, parent_path)
+                        except FileNotFoundError:
+                            return f"Error: Parent folder '{parent_path}' not found."
+                    
+                    try:
+                        folder_id = create_folder(service, folder_name, parent_id)
+                        path = f"{parent_path or '/'}{'' if parent_path and parent_path.endswith('/') else '/'}{folder_name}"
+                        return f"Created folder '{folder_name}' at path '{path}' with ID: {folder_id}"
+                    except Exception as e:
+                        return f"Error creating folder: {str(e)}"
+                
+                @tool
+                def list_drive_files(folder_path="/"):
+                    """List files and folders at the specified path in Google Drive.
+                    
+                    Args:
+                        folder_path: Path to the folder to list (default: root folder)
+                        
+                    Returns:
+                        List of files and folders in the specified location
+                    """
+                    service = st.session_state.service
+                    try:
+                        files = list_files(service, folder_path=folder_path)
+                        result = []
+                        for file in files:
+                            file_type = "Folder" if file.get("mimeType") == "application/vnd.google-apps.folder" else "File"
+                            result.append({
+                                "name": file.get("name", ""),
+                                "type": file_type,
+                                "id": file.get("id", ""),
+                                "modified": file.get("modifiedTime", "")
+                            })
+                        return f"Found {len(result)} items in '{folder_path}':\n{str(result)}"
+                    except Exception as e:
+                        return f"Error listing files: {str(e)}"
+                
+                @tool
+                def move_drive_file(file_path, destination_folder_path):
+                    """Move a file or folder to another location in Google Drive.
+                    
+                    Args:
+                        file_path: Full path to the file or folder to move
+                        destination_folder_path: Path to the destination folder
+                        
+                    Returns:
+                        Confirmation message if successful
+                    """
+                    service = st.session_state.service
+                    try:
+                        file_id = find_id_by_path(service, file_path)
+                        folder_id = find_id_by_path(service, destination_folder_path)
+                        move_file(service, file_id, folder_id)
+                        return f"Successfully moved '{file_path}' to '{destination_folder_path}'"
+                    except Exception as e:
+                        return f"Error moving file: {str(e)}"
+                
+                @tool
+                def delete_drive_item(path):
+                    """Delete a file or folder from Google Drive.
+                    
+                    Args:
+                        path: Path to the file or folder to delete
+                        
+                    Returns:
+                        Confirmation message if successful
+                    """
+                    service = st.session_state.service
+                    try:
+                        delete_by_path(service, path)
+                        return f"Successfully deleted '{path}'"
+                    except Exception as e:
+                        return f"Error deleting item: {str(e)}"
+                
+                @tool
+                def view_file_content(file_path):
+                    """View the content of a file from Google Drive.
+                    
+                    Args:
+                        file_path: Path to the text file to view
+                        
+                    Returns:
+                        The content of the file if it's a text file
+                    """
+                    service = st.session_state.service
+                    try:
+                        content = get_file_content(service, file_path)
+                        try:
+                            # Try to decode as text
+                            text_content = content.decode('utf-8')
+                            # Limit content length to avoid overwhelming the LLM
+                            if len(text_content) > 2000:
+                                text_content = text_content[:1997] + "..."
+                            return f"Content of '{file_path}':\n\n{text_content}"
+                        except UnicodeDecodeError:
+                            return f"'{file_path}' is not a text file."
+                    except Exception as e:
+                        return f"Error viewing file: {str(e)}"
+                
+                # Create a list of all tools
+                tools = [
+                    create_drive_folder,
+                    list_drive_files,
+                    move_drive_file, 
+                    delete_drive_item,
+                    view_file_content
+                ]
+
+                # Initialize the agent with our tools
+                agent = initialize_agent(
+                    llm=llm,
+                    tools=tools,
+                    agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,  # Changed agent type
+                    verbose=True
+                )
+
+                # Run the agent
+                with st.spinner("Thinking..."):
+                    response = agent.run(query)
+                    
+                st.success("Agent Response:")
+                st.write(response)
+
+            except Exception as e:
+                st.error(f"Agent error: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
+                            
 if __name__ == '__main__':
     main()
